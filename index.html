@@ -1834,7 +1834,7 @@ function perfAgainstPlanXLS(){
 function defaultMasterLists(){
   return {
     operatingUnits: OU_TEMPLATE.map(u=>({name:u.name, group:u.group, structure:u.structure})),
-    sectors: ['Agriculture','Manufacture','Mining and Energy','Financial Service','Service','Consumer'],
+    sectors: ['Agriculture','Manufacturing','Mining and Energy','Financial Service','Service','Consumer'],
     categories: ['Public','Private','Coop'],
     financingTypes: ['Project Financing','Lease Financing','Murabaha Financing','Ijarah Financing']
   };
@@ -4428,7 +4428,7 @@ function drawHomeOverviewCharts(){
 // the same sector always reads the same way across both charts.
 const SECTOR_CHART_STYLE = {
   'Agriculture':      { color:'#00A651', dash:[9,5]   },
-  'Manufacture':      { color:'#7030A0', dash:[]      },
+  'Manufacturing':      { color:'#7030A0', dash:[]      },
   'Mining and Energy':            { color:'#E2231A', dash:[2,3,8,3] },
   'Financial Service': { color:'#4F81BD', dash:[]      },
   'Service':           { color:'#00B0F0', dash:[1,3]   },
@@ -10826,7 +10826,7 @@ function exportTable04PDF(){
 // Financing. Unlike Tables 01-04 (Plan vs Actual performance), this table has no Plan
 // column: it reports actual Number of Loans, Approval Amount, Disbursement, Collection
 // (Principal/Interest) and Total Collection (Principal+Interest), by sector, restricted to
-// the same four sectors as Table 06's SME groups (Agriculture/Manufacture/Mining and Energy/Service).
+// the same four sectors as Table 06's SME groups (Agriculture/Manufacturing/Mining and Energy/Service).
 // Matches the official "table 5" template: a Monthly block and, directly below it on the
 // same sheet, a Cumulative (fiscal-year-to-date) block — both sharing one Fiscal
 // Year/Month (or other period-type) selection, exactly as Table 06's own "This Month" and
@@ -10842,7 +10842,7 @@ function table05GroupLabel(){
 }
 // Display labels match the official template's wording, which differs slightly from the
 // master sector list's own codes (e.g. "Manufacturing" vs the code "Manufacture").
-const TABLE05_SECTOR_LABELS = { Agriculture:'Agriculture', Manufacture:'Manufacturing', 'Mining and Energy':'Mining and Energy', Service:'Service' };
+const TABLE05_SECTOR_LABELS = { Agriculture:'Agriculture', Manufacturing:'Manufacturing', 'Mining and Energy':'Mining and Energy', Service:'Service' };
 function aggregateTable05(){
   const t5 = STATE.table5Filters;
   const range = periodRangeFor(t5);
@@ -11044,7 +11044,7 @@ function exportTable05PDF(){
 // loan's own District/HO column (`district`) rather than the flow records' Operating
 // Unit column. Recomputed on every render, so it always follows whichever reporting
 // period, sector or other Table 06 filter is currently selected.
-const TABLE6_SME_SECTORS = new Set(['Agriculture','Manufacture','Mining and Energy','Service']);
+const TABLE6_SME_SECTORS = new Set(['Agriculture','Manufacturing','Mining and Energy','Service']);
 // Given a list of 'YYYY-MM' periods, returns the Loan Detail reportPeriod ('YYYY-MM')
 // that this group's figures should be pulled "as of" — the latest month in the
 // selection, since Loan Outstanding/NPL is a point-in-time stock (reported as of a
@@ -14330,7 +14330,7 @@ function parseLoanDetailImportFile(file, subKind){
           });
           // Loan Detail sheets often spell sectors as "Manufacturing" / "Mining
           // & Energy" (or "Mining and Energy"), while the reporting templates
-          // and STATE.masterLists.sectors use "Manufacture" / "Mining" — the
+          // and STATE.masterLists.sectors use "Manufacturing" / "Mining" — the
           // By Sector / Annex balance reports key strictly off r.sector===
           // sector, so canonicalize here at import time or those loans would
           // silently drop out of the Manufacture/Mining sector rows.
