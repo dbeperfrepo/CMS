@@ -903,7 +903,7 @@ const CATEGORY_LABELS = { Coop:'Cooperative', Public:'Public', Private:'Private'
 const STANDARD_ROWS = [
   ['Agriculture','Coop'],['Agriculture','Public'],['Agriculture','Private'],
   ['Consumer','Private'],
-  ['Manufacture','Coop'],['Manufacture','Public'],['Manufacture','Private'],
+  ['Manufacturing','Coop'],['Manufacturing','Public'],['Manufacturing','Private'],
   ['Mining and Energy','Coop'],['Mining and Energy','Public'],['Mining and Energy','Private'],
   ['Service','Coop'],['Service','Public'],['Service','Private']
 ];
@@ -1830,6 +1830,43 @@ function perfAgainstPlanXLS(){
 }
 
 
+// Canonical sector names are "Manufacturing" and "Mining and Energy". Older saved data / uploaded
+// Plan aggregates / backups may still carry the legacy names "Manufacture", "Mining" or
+// "Mining & Energy". Any record, master-list entry or Plan-aggregate key still using a legacy
+// name silently drops out of the By Sector reports (rows come from the master list) while still
+// being counted by By Loaning Unit — which is what makes the two totals disagree.
+// Returns which stores changed so the caller can persist them.
+function canonicalSectorName(v){
+  if(v==='Manufacture') return 'Manufacturing';
+  if(v==='Mining' || v==='Mining & Energy') return 'Mining and Energy';
+  return v;
+}
+function migrateSectorNames(state){
+  const changed = { masterLists:false, records:false, loanRecords:false, balancePlanAggregates:false, reinstatedLoansData:false, nplMovementData:false };
+  if(state.masterLists && Array.isArray(state.masterLists.sectors)){
+    const out = [];
+    state.masterLists.sectors.forEach(x=>{ const y = canonicalSectorName(x); if(y!==x) changed.masterLists = true; if(!out.includes(y)) out.push(y); });
+    if(out.length !== state.masterLists.sectors.length) changed.masterLists = true;
+    state.masterLists.sectors = out;
+  }
+  const fixArr = arr => { let ch = false; (arr||[]).forEach(r=>{ if(r && typeof r==='object' && typeof r.sector==='string' && canonicalSectorName(r.sector)!==r.sector){ r.sector = canonicalSectorName(r.sector); ch = true; } }); return ch; };
+  changed.records = fixArr(state.records);
+  changed.loanRecords = fixArr(state.loanRecords);
+  changed.reinstatedLoansData = fixArr(state.reinstatedLoansData);
+  changed.nplMovementData = fixArr(state.nplMovementData);
+  // Uploaded Plan aggregates are keyed by sector NAME (entry.bySector[sector] = [Q1..Q4]).
+  (state.balancePlanAggregates||[]).forEach(e=>{
+    if(!e || !e.bySector || typeof e.bySector!=='object') return;
+    Object.keys(e.bySector).forEach(k=>{
+      const c = canonicalSectorName(k);
+      if(c===k) return;
+      if(!(c in e.bySector)) e.bySector[c] = e.bySector[k];
+      delete e.bySector[k];
+      changed.balancePlanAggregates = true;
+    });
+  });
+  return changed;
+}
 /* ---------------------------- Default seed data ------------------------- */
 function defaultMasterLists(){
   return {
@@ -2056,24 +2093,15 @@ async function loadAll(){
   if(!reinstated){ await storeSet(STORE_KEYS.reinstatedLoansData, STATE.reinstatedLoansData); }
   if(!nplMovement){ await storeSet(STORE_KEYS.nplMovementData, STATE.nplMovementData); }
   STATE.masterLists = ml || defaultMasterLists();
-  // Sector rename: legacy "Mining" -> "Mining and Energy" (stored lists & loan/plan data).
-  (function migrateMiningSector(){
-    const fix = v => (v==='Mining' || v==='Mining & Energy') ? 'Mining and Energy' : v;
-    let ml2 = false;
-    if(STATE.masterLists && Array.isArray(STATE.masterLists.sectors)){
-      const out = [];
-      STATE.masterLists.sectors.forEach(x=>{ const y = fix(x); if(y!==x) ml2 = true; if(!out.includes(y)) out.push(y); });
-      if(out.length !== STATE.masterLists.sectors.length) ml2 = true;
-      STATE.masterLists.sectors = out;
-    }
-    const fixArr = arr => { let ch = false; (arr||[]).forEach(r=>{ if(r && typeof r==='object' && r.sector && fix(r.sector)!==r.sector){ r.sector = fix(r.sector); ch = true; } }); return ch; };
-    const c1 = fixArr(STATE.records), c2 = fixArr(STATE.loanRecords), c3 = fixArr(STATE.balancePlanAggregates), c4 = fixArr(STATE.reinstatedLoansData), c5 = fixArr(STATE.nplMovementData);
-    if(ml2) storeSet(STORE_KEYS.masterLists, STATE.masterLists);
-    if(c1) storeSet(STORE_KEYS.records, STATE.records);
-    if(c2) storeSet(STORE_KEYS.loanRecords, STATE.loanRecords);
-    if(c3) storeSet(STORE_KEYS.balancePlanAggregates, STATE.balancePlanAggregates);
-    if(c4) storeSet(STORE_KEYS.reinstatedLoansData, STATE.reinstatedLoansData);
-    if(c5) storeSet(STORE_KEYS.nplMovementData, STATE.nplMovementData);
+  // Rename legacy sector names (Manufacture / Mining) in all stored data — see migrateSectorNames().
+  (function(){
+    const ch = migrateSectorNames(STATE);
+    if(ch.masterLists) storeSet(STORE_KEYS.masterLists, STATE.masterLists);
+    if(ch.records) storeSet(STORE_KEYS.records, STATE.records);
+    if(ch.loanRecords) storeSet(STORE_KEYS.loanRecords, STATE.loanRecords);
+    if(ch.balancePlanAggregates) storeSet(STORE_KEYS.balancePlanAggregates, STATE.balancePlanAggregates);
+    if(ch.reinstatedLoansData) storeSet(STORE_KEYS.reinstatedLoansData, STATE.reinstatedLoansData);
+    if(ch.nplMovementData) storeSet(STORE_KEYS.nplMovementData, STATE.nplMovementData);
   })();
   STATE.adminPin = pin || '2580';
   STATE.genericReports = gr || [];
@@ -14646,7 +14674,7 @@ const PLAN_ANNUAL_SECTOR_ROWS = [
   ['Service','Cooperative'], ['Service','Public'], ['Service','Private'],
   ['Consumer','Private']
 ];
-const PLAN_ANNUAL_SECTOR_LABEL_MAP = { 'Agriculture':'Agriculture', 'Manufacturing':'Manufacture', 'Mining':'Mining and Energy', 'Mining & Energy':'Mining and Energy', 'Mining and Energy':'Mining and Energy', 'Wholesale':'Financial Service', 'Service':'Service', 'Consumer':'Consumer', 'Financial Service':'Financial Service' };
+const PLAN_ANNUAL_SECTOR_LABEL_MAP = { 'Agriculture':'Agriculture', 'Manufacturing':'Manufacturing', 'Manufacture':'Manufacturing', 'Mining':'Mining and Energy', 'Mining & Energy':'Mining and Energy', 'Mining and Energy':'Mining and Energy', 'Wholesale':'Financial Service', 'Service':'Service', 'Consumer':'Consumer', 'Financial Service':'Financial Service' };
 const PLAN_ANNUAL_CATEGORY_MAP = { 'Cooperative':'Coop', 'Public':'Public', 'Private':'Private' };
 // Column layout (0-based, Excel-numbered rows/cols): B=Loaning Unit(1), C=Sector(2),
 // D=Category(3), E..P=Jul..Jun(4..15), Q=Annual Total(16). First data row is Excel row 9 (0-based 7).
@@ -16243,7 +16271,7 @@ function matchSectorLoose(list, v){
   if(!s) return null;
   const pick = name => list.find(x=>String(x).toLowerCase()===name.toLowerCase()) || null;
   if(/agri|crop|livestock|horticult|forest/.test(s)) return pick('Agriculture');
-  if(/manufactur|industr/.test(s))                   return pick('Manufacture');
+  if(/manufactur|industr/.test(s))                   return pick('Manufacturing');
   if(/mining|\bmine|energy/.test(s))                 return pick('Mining and Energy');
   if(/financ|bank|insur/.test(s))                    return pick('Financial Service');
   if(/consum/.test(s))                               return pick('Consumer');
@@ -16322,7 +16350,7 @@ function historicalReasonLabel(text){
 // canonical "Manufacture" and "Mining". Checked only after an exact
 // canonical match fails, and only returned if the alias target is actually
 // on the list passed in.
-const SECTOR_LABEL_ALIASES = { 'manufacturing':'Manufacture', 'mining':'Mining and Energy', 'mining and energy':'Mining and Energy' };
+const SECTOR_LABEL_ALIASES = { 'manufacture':'Manufacturing', 'manufacturing':'Manufacturing', 'mining':'Mining and Energy', 'mining and energy':'Mining and Energy' };
 function matchSectorCanonical(list, v){
   const exact = matchCanonical(list, v);
   if(exact) return exact;
@@ -16848,12 +16876,8 @@ function bindAdminEvents(){
           if(!confirm('Restore backup? This will overwrite current records and master lists.')) return;
           STATE.records = data.records || [];
           STATE.masterLists = data.masterLists || defaultMasterLists();
-          // Old backups may still use the legacy "Mining" sector name.
-          (function(){
-            const fix = v => (v==='Mining' || v==='Mining & Energy') ? 'Mining and Energy' : v;
-            if(Array.isArray(STATE.masterLists.sectors)){ const o=[]; STATE.masterLists.sectors.forEach(x=>{ const y=fix(x); if(!o.includes(y)) o.push(y); }); STATE.masterLists.sectors=o; }
-            STATE.records.forEach(r=>{ if(r && r.sector) r.sector = fix(r.sector); });
-          })();
+          // Old backups may still use legacy sector names (Manufacture / Mining).
+          migrateSectorNames(STATE);
           await storeSet(STORE_KEYS.records, STATE.records);
           await storeSet(STORE_KEYS.masterLists, STATE.masterLists);
           logAudit('Backup restored', 'System data restored from an uploaded backup file ('+STATE.records.length+' record(s)).');
