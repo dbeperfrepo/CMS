@@ -1352,6 +1352,8 @@ const ALIAS_GLOSSARY = {
 // approves any of these. Still fully editable afterwards from Admin ->
 // Language & Terminology, same as every other glossary entry.
 const CLAUDE_GLOSSARY = {
+  "Sub-Total Corporate": "ንዑስ ድምር ኮርፖሬት",
+  "Sub-Total Districts": "ንዑስ ድምር ዲስትሪክቶች",
   "% Share": "% ድርሻ",
   "Access restricted": "መዳረሻ ተከልክሏል",
   "Action": "ተግባር",
@@ -1919,6 +1921,7 @@ const STATE = {
   balancePlanImportRows: null,
   balancePlanImportErrors: [],
   historicalImport:{ rows:null, errors:[], skipped:[], fileName:null, newUnits:[] },
+  historicalImportMode:'append', // 'append' = keep existing data and add the file's figures | 'replace' = clear the file's periods first
   homeScale:'billion',
   homePeriodMode:'all', // 'all' = all periods on file (default), 'current' = current fiscal year Plan (full year) vs Actual to date, 'ytd' = current fiscal year Plan vs Actual for elapsed fiscal months only
   reportFilters:{ periodType:'month', year:String(new Date().getFullYear()), month:String(new Date().getMonth()+1).padStart(2,'0'),
@@ -2332,13 +2335,16 @@ function periodsAggregationActive(periods){
   const maxPeriod = periods.reduce((m,p)=> p>m ? p : m, periods[0]);
   return maxPeriod >= AGGREGATION_CUTOFF_PERIOD;
 }
+const CORPORATE_AGRI_FINANCING_UNIT = 'Corporate Agricultural Financing Directorate';
 const RETIRED_UNIT_MAP = {
-  'Crop Production Directorate': 'Corporate Agriculture Directorate',
-  'Horticulture & Forestry Directorate': 'Corporate Agriculture Directorate',
-  'Poultry Directorate': 'Corporate Agriculture Directorate',
-  'Livestock Directorate': 'Corporate Agriculture Directorate',
+  'Crop Production Directorate': CORPORATE_AGRI_FINANCING_UNIT,
+  'Horticulture & Forestry Directorate': CORPORATE_AGRI_FINANCING_UNIT,
+  'Poultry Directorate': CORPORATE_AGRI_FINANCING_UNIT,
+  'Textile and Leather Directorate': CORPORATE_AGRI_FINANCING_UNIT,
+  'Livestock Directorate': CORPORATE_AGRI_FINANCING_UNIT,
+  // Same unit under two names: records carrying the older label are folded into the current one.
+  'Corporate Agriculture Directorate': CORPORATE_AGRI_FINANCING_UNIT,
   'Wood,Metals and Others Directorate': 'Corporate Manufacturing Directorate',
-  'Textile and Leather Directorate': 'Corporate Manufacturing Directorate',
   'Chemicals and Pharmaceuticals Directorate': 'Corporate Manufacturing Directorate',
   'Mining, Energy and Construction Directorate': 'Corporate Mining and Energy Directorate',
   'Food and Agro-Processing Directorate': 'Corporate Food and Agro-Processing Directorate',
@@ -2347,6 +2353,62 @@ const RETIRED_UNIT_MAP = {
 };
 const RETIRED_UNIT_NAMES = Object.keys(RETIRED_UNIT_MAP);
 function resolveRetiredUnit(name){ return RETIRED_UNIT_MAP[name] || name; }
+
+// ---- External Fund and Credit Management Directorate -> split into two new loaning units ----
+// 'Rural Program & Project Directorate' and 'MSME & Green Economy Program & Projects Directorate'
+// were split from it. Historical figures recorded under the retired unit cannot be divided, so in
+// the Quarter (six-pack) reports and the main Report tab the retired unit is kept as its own hidden
+// bucket and, in every column where it holds a value (i.e. the historical columns), the two new
+// units' cells are MERGED into one cell showing the retired unit's value. Columns that hold current
+// data (recorded under the two new units) keep one value per unit row. Totals include the bucket once.
+const EF_UNIT = 'External Fund and Credit Management Directorate';
+const SPLIT_UNIT_PAIR = ['Rural Program & Project Directorate','MSME & Green Economy Program & Projects Directorate'];
+// A loaning unit's records can carry either name for the retired unit ('External Fund and Credit
+// Management Directorate' or its alias 'ECG&RUFIP'); both land in the same hidden bucket so the
+// amount is never dropped from the loaning-unit tables or their totals.
+const EF_UNIT_ALIASES = [EF_UNIT, 'ECG&RUFIP'];
+// Loaning-unit names that occur in the data but are not in the master list (a spelling variant, a
+// unit added later...). They are listed as their own rows so no record is silently dropped from the
+// By Loaning Unit tables — an all-empty one is never shown.
+function unlistedUnitNames(effNames){
+  const known = new Set(STATE.masterLists.operatingUnits.map(u=>u.name));
+  return [...new Set(effNames)].filter(n=>n && !known.has(n));
+}
+function resolveUnitKeepSplit(name){ return EF_UNIT_ALIASES.includes(name) ? EF_UNIT : resolveRetiredUnit(name); }
+function keepSplitDimFilter(name){ return name===EF_UNIT || (!RETIRED_UNIT_NAMES.includes(name) && name!=='ECG&RUFIP'); }
+function markSplitUnitMerge(rows, allRows, efRow, valueKeys, derived, finish){
+  if(!efRow) return rows;
+  const A = SPLIT_UNIT_PAIR[0], B = SPLIT_UNIT_PAIR[1];
+  const rawA = allRows.find(r=>r.name===A), rawB = allRows.find(r=>r.name===B);
+  if(!rawA || !rawB) return rows;
+  const mk = new Set(valueKeys.filter(k=>(efRow[k]||0)!==0));
+  if(!mk.size) return rows;
+  Object.keys(derived).forEach(d=>{ if(derived[d].some(k=>mk.has(k))) mk.add(d); });
+  const C = { name:A, group:rawA.group };
+  valueKeys.forEach(k=>{ C[k] = (efRow[k]||0)+(rawA[k]||0)+(rawB[k]||0); });
+  finish(C);
+  const byName = new Map(rows.map(r=>[r.name, r]));
+  return allRows.filter(r=>byName.has(r.name)||r.name===A||r.name===B).map(r=>{
+    if(r.name===A) return Object.assign({}, rawA, { mergeRole:'first',  mergeKeys:mk, mergedDisplay:C });
+    if(r.name===B) return Object.assign({}, rawB, { mergeRole:'second', mergeKeys:mk, mergedDisplay:C });
+    return byName.get(r.name);
+  });
+}
+// Renders a row's numeric cells; where the row is part of the merged pair, the cells of merged
+// columns (keys[i] in row.mergeKeys) become one rowspan=2 cell on the first row and are omitted
+// on the second.
+function splitMergeRender(r, keys, fn){
+  if(!r || !r.mergeRole) return fn(r);
+  const re = /<td class="num[^"]*">[\s\S]*?<\/td>/g;
+  const own = fn(r), mer = fn(r.mergedDisplay);
+  const ownT = own.match(re)||[], merT = mer.match(re)||[];
+  const at = own.search(re);
+  const prefix = at>0 ? own.slice(0,at) : '';
+  return prefix + ownT.map((t,i)=>{
+    if(!r.mergeKeys.has(keys[i])) return t;
+    return r.mergeRole==='first' ? merT[i].replace('<td class="num','<td rowspan="2" style="vertical-align:middle;" class="num') : '';
+  }).join('');
+}
 
 // Fixed display order for loaning units in every report / pivot output (set by management):
 //   Corporate Loaning Units -> three era blocks (FY2025/26 onwards, on-and-before Dec 2022,
@@ -2462,11 +2524,11 @@ const LEGACY_ZERO_HIDE_UNITS = ['Addis Ababa District'];
 // re-attributed to the Human Resource Management Directorate for reporting purposes only.
 // Option 2 (default) reports every record under its originating unit, as recorded.
 const CONSUMER_REALLOCATION_TARGET = 'Human Resource Management Directorate';
-function effectiveOperatingUnit(r, reportOption, aggregationActive){
+function effectiveOperatingUnit(r, reportOption, aggregationActive, keepSplit){
   // Retired-unit consolidation only applies once the report's own period reaches the
   // organizational transition (see AGGREGATION_CUTOFF_PERIOD) — for an earlier report,
   // the loaning unit is shown exactly as recorded (no renaming/folding).
-  const unit = aggregationActive ? resolveRetiredUnit(r.operatingUnit) : r.operatingUnit;
+  const unit = aggregationActive ? (keepSplit ? resolveUnitKeepSplit(r.operatingUnit) : resolveRetiredUnit(r.operatingUnit)) : r.operatingUnit;
   if(reportOption==='option1' && r.sector==='Consumer' && unitGroup(unit)==='Districts'){
     return CONSUMER_REALLOCATION_TARGET;
   }
@@ -4939,6 +5001,9 @@ function balanceTableHead(firstColLabel, bm, includeGroupCol){
 // The five data cells shared by every row of the three Outstanding/NPLs
 // tables (label cell is added by the caller, since it differs by tab).
 function balanceRowCells(r, sc){
+  return splitMergeRender(r, ['planThis','actualThis','actualPrevPeriod','actualPrevYearSame','perfThis','changePrevPeriod','changePrevYearSame'], x=>balanceRowCellsRaw(x, sc));
+}
+function balanceRowCellsRaw(r, sc){
   return `
       <td class="num">${fmtScaled(r.planThis, sc)}</td>
       <td class="num">${fmtScaled(r.actualThis, sc)}</td>
@@ -4996,6 +5061,9 @@ function balanceNplUnitTableHead(bm){
 // Ratio and changes are shown without good/bad colouring: for NPLs the "good"
 // direction is a fall, which the shared green-for-positive change styling would invert.
 function balanceNplUnitRowCells(r, sc){
+  return splitMergeRender(r, ['outstanding','npl','nplPrevPeriod','nplPrevYearSame','ratio','changePrevPeriod','changePrevYearSame'], x=>balanceNplUnitRowCellsRaw(x, sc));
+}
+function balanceNplUnitRowCellsRaw(r, sc){
   return `
       <td class="num">${fmtScaled(r.outstanding, sc)}</td>
       <td class="num">${fmtScaled(r.npl, sc)}</td>
@@ -5011,11 +5079,11 @@ function balanceNplUnitRowCells(r, sc){
 // rows (e.g. the Corporate-only scope has no districts) is omitted, as on the
 // plain By Loaning Unit tab.
 function balanceNplUnitBodyRows(grp, sc){
-  const block = (label, rows, totalLabel, total)=> !rows.length ? '' :
-    rows.map((r,i)=>`<tr>${i===0 ? `<td rowspan="${rows.length}" style="font-weight:700;background:var(--panel-soft,#f4f6f8);text-align:center;vertical-align:middle;">${escapeHtml(tx(label))}</td>` : ''}<td>${escapeHtml(tx(r.name))}</td>${balanceNplUnitRowCells(r, sc)}</tr>`).join('')
-    + `<tr class="subtotal"><td colspan="2">${escapeHtml(tx(totalLabel))}</td>${balanceNplUnitRowCells(total, sc)}</tr>`;
-  return block('Corporate', grp.corporateRows, 'Corporate Total', grp.corporateTotal)
-    + block('SMEs/Districts', grp.districtRows, 'SMEs Total', grp.districtTotal)
+  // Corporate / SMEs sub-total rows are omitted (only the Grand-Total remains).
+  const block = (label, rows)=> !rows.length ? '' :
+    rows.map((r,i)=>`<tr>${i===0 ? `<td rowspan="${rows.length}" style="font-weight:700;background:var(--panel-soft,#f4f6f8);text-align:center;vertical-align:middle;">${escapeHtml(tx(label))}</td>` : ''}<td>${escapeHtml(tx(r.name))}</td>${balanceNplUnitRowCells(r, sc)}</tr>`).join('');
+  return block('Corporate', grp.corporateRows)
+    + block('SMEs/Districts', grp.districtRows)
     + `<tr class="subtotal grand"><td colspan="2">${tx('Grand-Total')}</td>${balanceNplUnitRowCells(grp.grandTotal, sc)}</tr>`;
 }
 
@@ -5102,7 +5170,13 @@ function quarterCompTableHead(cm, firstColLabel){
 // `isRatio` formats every amount cell as a percentage (fmtPerfDash) instead
 // of a scaled-currency amount (fmtScaled), for rows that are themselves a
 // ratio (e.g. NPLs Ratio) rather than a Birr amount.
+// By Loaning Unit: scopes that also get Corporate / Districts sub-total rows (index into
+// ANNEX_GROUP_DEFS). Only the Bank Level report (0) mixes both groups in one table.
+function unitSubtotalsApply(groupIndex){ return groupIndex===0; }
 function quarterCompRowCells(r, cm, sc, isRatio){
+  return splitMergeRender(r, (cm.isFirstOfFY ? ['planThis','actualThis','actualPrevPeriod','actualPrevYearSame','perfThis','changePrevPeriod','changePrevYearSame'] : ['planThis','actualThis','actualPrevPeriod','planCum','actualCum','actualPrevYearSame','actualPrevYearCum','perfThis','perfCum','changePrevPeriod','changePrevYearSame','changeCum']), x=>quarterCompRowCellsRaw(x, cm, sc, isRatio));
+}
+function quarterCompRowCellsRaw(r, cm, sc, isRatio){
   const fmt = v => isRatio ? fmtPerfDash(v) : fmtScaled(v, sc);
   return `
       <td class="num">${fmt(r.planThis)}</td>
@@ -5205,7 +5279,7 @@ function aggregateBalanceSectorLoaningUnit(metric){
   // so this mirrors effectiveOperatingUnit()'s retired-unit/Consumer-
   // reallocation logic but reads r.district instead of r.operatingUnit.
   function effectiveLoanUnit(r){
-    const unit = aggregationActive ? resolveRetiredUnit(r.district) : r.district;
+    const unit = aggregationActive ? resolveUnitKeepSplit(r.district) : r.district;
     if(reportOption==='option1' && r.sector==='Consumer' && unitGroup(unit)==='Districts'){
       return CONSUMER_REALLOCATION_TARGET;
     }
@@ -5351,7 +5425,9 @@ function aggregateBalanceSectorLoaningUnit(metric){
     return { rows, byName: new Map(rows.map(r=>[r.name, r])) };
   }
   function hideEmptyLegacyRows(rows){
-    return rows.filter(r=> (r.group!=='Corporate' && !LEGACY_ZERO_HIDE_UNITS.includes(r.name)) || r.planThis || r.actualThis);
+    // A row is dropped only when EVERY column is empty — a unit whose only figures are historical
+    // (previous period / same period last year) stays visible so the table foots to its totals.
+    return rows.filter(r=> (r.group!=='Corporate' && !LEGACY_ZERO_HIDE_UNITS.includes(r.name) && !balExtraUnits.includes(r.name)) || r.planThis || r.actualThis || r.actualPrevPeriod || r.actualPrevYearSame);
   }
   function sumUnitRow(name, group, a, b){
     return finishUnitRow({
@@ -5373,21 +5449,32 @@ function aggregateBalanceSectorLoaningUnit(metric){
     t.changePrevYearSame = pctChange(t.actualThis, t.actualPrevYearSame);
     return t;
   }
+  const balExtraUnits = unlistedUnitNames(allLoanRecs.map(effectiveLoanUnit));
   function dimsFor(def){
     let gDims = STATE.masterLists.operatingUnits.map(u=>u.name);
-    if(aggregationActive) gDims = gDims.filter(name=>!RETIRED_UNIT_NAMES.includes(name));
+    if(aggregationActive) gDims = gDims.filter(keepSplitDimFilter);
+    gDims = gDims.concat(balExtraUnits);
     if(def.unitGroupOnly) gDims = gDims.filter(name=>unitGroup(name)===def.unitGroupOnly);
     return sortOperatingUnitDims(gDims, range.thisPeriod);
   }
   function finalizeUnitScope(def, rawRows){
-    const gRows = hideEmptyLegacyRows(rawRows);
+    // The retired External Fund bucket is never shown as its own row: it is counted once in the
+    // totals and displayed through the merged cells of its two successor units.
+    const efRow = aggregationActive ? rawRows.find(r=>r.name===EF_UNIT) : undefined;
+    const rawNoEF = efRow ? rawRows.filter(r=>r.name!==EF_UNIT) : rawRows;
+    const gRows = hideEmptyLegacyRows(rawNoEF);
     const gCorporateRows = gRows.filter(r=>r.group==='Corporate');
     const gDistrictRows = gRows.filter(r=>r.group!=='Corporate');
+    const efList = efRow ? [efRow] : [];
+    const gCorporateShown = markSplitUnitMerge(gCorporateRows, rawNoEF.filter(r=>r.group==='Corporate'), efRow,
+      ['planThis','actualThis','actualPrevPeriod','actualPrevYearSame'],
+      { perfThis:['planThis','actualThis'], changePrevPeriod:['actualThis','actualPrevPeriod'], changePrevYearSame:['actualThis','actualPrevYearSame'] },
+      finishUnitRow);
     return {
       label: def.label, reportBase: def.reportBase,
-      corporateRows: gCorporateRows, corporateTotal: unitTotalsOf(gCorporateRows),
+      corporateRows: gCorporateShown, corporateTotal: unitTotalsOf(gCorporateRows.concat(efList)),
       districtRows: gDistrictRows, districtTotal: unitTotalsOf(gDistrictRows),
-      grandTotal: unitTotalsOf(gRows)
+      grandTotal: unitTotalsOf(gRows.concat(efList))
     };
   }
   const groupUnitReportsRaw = new Array(ANNEX_GROUP_DEFS.length);
@@ -5419,7 +5506,7 @@ function aggregateBalanceSectorLoaningUnit(metric){
   // no Cumulative column, so only Plan/Actual "this period" are compared.
   const groupConsistency = ANNEX_GROUP_DEFS.map((def,i)=>({
     label: def.reportBase,
-    mismatches: groupTotalMismatches(annexGroups[i].total, groupUnitReports[i].grandTotal, ['planThis','actualThis'])
+    mismatches: groupTotalMismatches(annexGroups[i].total, groupUnitReports[i].grandTotal, ['planThis','actualThis','actualPrevPeriod','actualPrevYearSame'])
   }));
 
   // ---- By Loaning Unit 2 (NPL ratio template) — the same six ANNEX_GROUP_DEFS
@@ -5454,8 +5541,11 @@ function aggregateBalanceSectorLoaningUnit(metric){
       if(inPrev) a.nplPrevPeriod += nplVal;
       if(inPrevYear) a.nplPrevYearSame += nplVal;
     });
-    return dims.map(name=>finishNplRow(acc.get(name)))
-      .filter(r=> (r.group!=='Corporate' && !LEGACY_ZERO_HIDE_UNITS.includes(r.name)) || r.outstanding || r.npl || r.nplPrevPeriod || r.nplPrevYearSame);
+    const allNpl = dims.map(name=>finishNplRow(acc.get(name)));
+    const keptNpl = allNpl
+      .filter(r=> (r.group!=='Corporate' && !LEGACY_ZERO_HIDE_UNITS.includes(r.name) && !balExtraUnits.includes(r.name)) || r.outstanding || r.npl || r.nplPrevPeriod || r.nplPrevYearSame);
+    keptNpl.raw = allNpl;
+    return keptNpl;
   }
   function nplUnitTotalsOf(rows){
     return finishNplRow(rows.reduce((t,r)=>({
@@ -5466,17 +5556,26 @@ function aggregateBalanceSectorLoaningUnit(metric){
   const groupNplUnitReports = ANNEX_GROUP_DEFS.map(def=>{
     const baseList = def.filter ? allLoanRecs.filter(r=>def.filter(r, annexUnitGroup)) : allLoanRecs;
     let gDims = STATE.masterLists.operatingUnits.map(u=>u.name);
-    if(aggregationActive) gDims = gDims.filter(name=>!RETIRED_UNIT_NAMES.includes(name));
+    if(aggregationActive) gDims = gDims.filter(keepSplitDimFilter);
+    gDims = gDims.concat(balExtraUnits);
     if(def.unitGroupOnly) gDims = gDims.filter(name=>unitGroup(name)===def.unitGroupOnly);
     gDims = sortOperatingUnitDims(gDims, range.thisPeriod);
-    const gRows = nplUnitRowsFor(baseList, gDims);
+    const gRowsFull = nplUnitRowsFor(baseList, gDims);
+    const efRow = aggregationActive ? gRowsFull.raw.find(r=>r.name===EF_UNIT) : undefined;
+    const gRows = efRow ? gRowsFull.filter(r=>r.name!==EF_UNIT) : gRowsFull;
+    const rawNoEF = efRow ? gRowsFull.raw.filter(r=>r.name!==EF_UNIT) : gRowsFull.raw;
+    const efList = efRow ? [efRow] : [];
     const gCorporateRows = gRows.filter(r=>r.group==='Corporate');
     const gDistrictRows = gRows.filter(r=>r.group!=='Corporate');
+    const gCorporateShown = markSplitUnitMerge(gCorporateRows, rawNoEF.filter(r=>r.group==='Corporate'), efRow,
+      ['outstanding','npl','nplPrevPeriod','nplPrevYearSame'],
+      { ratio:['npl','outstanding'], changePrevPeriod:['npl','nplPrevPeriod'], changePrevYearSame:['npl','nplPrevYearSame'] },
+      finishNplRow);
     return {
       label: def.label, reportBase: def.reportBase,
-      corporateRows: gCorporateRows, corporateTotal: nplUnitTotalsOf(gCorporateRows),
+      corporateRows: gCorporateShown, corporateTotal: nplUnitTotalsOf(gCorporateRows.concat(efList)),
       districtRows: gDistrictRows, districtTotal: nplUnitTotalsOf(gDistrictRows),
-      grandTotal: nplUnitTotalsOf(gRows)
+      grandTotal: nplUnitTotalsOf(gRows.concat(efList))
     };
   });
 
@@ -5721,16 +5820,18 @@ function aggregateQuarterSectorLoaningUnit(){
     t.changeCum = pctChange(t.actualCum, t.actualPrevYearCum);
     return t;
   }
+  const flowExtraUnits = unlistedUnitNames(recs.map(r=>effectiveOperatingUnit(r, f.reportOption, aggregationActive, true)));
   const groupUnitReports = ANNEX_GROUP_DEFS.map(def=>{
     const baseList = def.filter ? recs.filter(r=>def.filter(r, annexUnitGroup)) : recs;
     let gDims = STATE.masterLists.operatingUnits.map(u=>u.name);
-    if(aggregationActive) gDims = gDims.filter(name=>!RETIRED_UNIT_NAMES.includes(name));
+    if(aggregationActive) gDims = gDims.filter(keepSplitDimFilter);
+    gDims = gDims.concat(flowExtraUnits);
     if(def.unitGroupOnly) gDims = gDims.filter(name=>unitGroup(name)===def.unitGroupOnly);
     if(hideCorporateDims) gDims = gDims.filter(name=>unitGroup(name)!=='Corporate');
     if(hideDistrictDims) gDims = gDims.filter(name=>unitGroup(name)==='Corporate');
     gDims = sortOperatingUnitDims(gDims, range.thisPeriod);
     let gRows = gDims.map(name=>{
-      const subset = baseList.filter(r=>effectiveOperatingUnit(r, f.reportOption, aggregationActive)===name);
+      const subset = baseList.filter(r=>effectiveOperatingUnit(r, f.reportOption, aggregationActive, true)===name);
       const planThis = sumFor(subset, range.thisPeriod, 'plan');
       const actualThis = sumFor(subset, range.thisPeriod, 'actual');
       const actualPrevPeriod = sumFor(subset, prevPeriod, 'actual');
@@ -5747,21 +5848,35 @@ function aggregateQuarterSectorLoaningUnit(){
         changeCum: pctChange(actualCum, actualPrevYearCum)
       };
     });
-    gRows = gRows.filter(r=> (r.group!=='Corporate' && !LEGACY_ZERO_HIDE_UNITS.includes(r.name)) || r.planThis || r.actualThis || r.planCum || r.actualCum);
+    const efRow = aggregationActive ? gRows.find(r=>r.name===EF_UNIT) : undefined;
+    if(efRow) gRows = gRows.filter(r=>r.name!==EF_UNIT);
+    const gRowsRaw = gRows;
+    gRows = gRows.filter(r=> (r.group!=='Corporate' && !LEGACY_ZERO_HIDE_UNITS.includes(r.name) && !flowExtraUnits.includes(r.name)) || r.planThis || r.actualThis || r.planCum || r.actualCum || r.actualPrevPeriod || r.actualPrevYearSame || r.actualPrevYearCum);
+    const efList = efRow ? [efRow] : [];
     const gCorporateRows = gRows.filter(r=>r.group==='Corporate');
     const gDistrictRows = gRows.filter(r=>r.group!=='Corporate');
+    const gCorporateShown = markSplitUnitMerge(gCorporateRows, gRowsRaw.filter(r=>r.group==='Corporate'), efRow,
+      ['planThis','actualThis','actualPrevPeriod','planCum','actualCum','actualPrevYearSame','actualPrevYearCum'],
+      { perfThis:['planThis','actualThis'], perfCum:['planCum','actualCum'],
+        changePrevPeriod:['actualThis','actualPrevPeriod'], changePrevYearSame:['actualThis','actualPrevYearSame'], changeCum:['actualCum','actualPrevYearCum'] },
+      o=>{
+        o.perfThis = withPerf(o.planThis, o.actualThis); o.perfCum = withPerf(o.planCum, o.actualCum);
+        o.changePrevPeriod = pctChange(o.actualThis, o.actualPrevPeriod);
+        o.changePrevYearSame = pctChange(o.actualThis, o.actualPrevYearSame);
+        o.changeCum = pctChange(o.actualCum, o.actualPrevYearCum);
+      });
     return {
       label: def.label, reportBase: def.reportBase,
-      corporateRows: gCorporateRows, corporateTotal: unitTotalsOf(gCorporateRows),
+      corporateRows: gCorporateShown, corporateTotal: unitTotalsOf(gCorporateRows.concat(efList)),
       districtRows: gDistrictRows, districtTotal: unitTotalsOf(gDistrictRows),
-      grandTotal: unitTotalsOf(gRows)
+      grandTotal: unitTotalsOf(gRows.concat(efList))
     };
   });
 
   // See groupTotalMismatches() above.
   const groupConsistency = ANNEX_GROUP_DEFS.map((def,i)=>({
     label: def.reportBase,
-    mismatches: groupTotalMismatches(annexGroups[i].total, groupUnitReports[i].grandTotal, ['planThis','actualThis','planCum','actualCum'])
+    mismatches: groupTotalMismatches(annexGroups[i].total, groupUnitReports[i].grandTotal, ['planThis','actualThis','planCum','actualCum','actualPrevPeriod','actualPrevYearSame','actualPrevYearCum'])
   }));
 
   return { range, sectorRows, sectorTotal, sectorComparative, sectorComparativeTotal, sectorComparativeMeta, sectorTrendPeriods, sectorTrend, groupSectorTrends, annexGroups, annexMeta, corporateRows, corporateTotal, districtRows, districtTotal, grandTotal, groupUnitReports, groupConsistency };
@@ -6349,6 +6464,9 @@ function rwConsistencyColumnLabel(cm, key){
   if(key==='planThis') return tx('Plan')+' – '+cm.selectedLabel;
   if(key==='actualThis') return tx('Actual')+' – '+cm.selectedLabel;
   if(key==='planCum') return tx('Plan')+' – '+tx(cm.cumulativeLabel);
+  if(key==='actualPrevPeriod') return tx('Actual')+' – '+(cm.prevPeriodLabel||'');
+  if(key==='actualPrevYearSame') return tx('Actual')+' – '+(cm.prevYearSameLabel||'');
+  if(key==='actualPrevYearCum') return tx('Actual')+' – '+tx(cm.previousFYLabel||'')+' '+tx(cm.cumulativeLabel||'');
   return tx('Actual')+' – '+tx(cm.cumulativeLabel); // 'actualCum'
 }
 // Flat list of every mismatch across both flow metrics (see consistencyCheck()
@@ -7890,10 +8008,10 @@ function renderQuarterReports(){
             <tbody>
               ${grp.corporateRows.length ? `<tr><td colspan="${groupHeadColspan}" style="font-weight:700;background:var(--panel-soft,#f4f6f8);">${tx('Corporate')}</td></tr>
               ${grp.corporateRows.map(r=>compDataRow(r)).join('')}
-              ${compDataRow(Object.assign({name:'Corporate Sub-total'}, grp.corporateTotal), 'subtotal')}` : ''}
+              ${unitSubtotalsApply(i) ? compDataRow(Object.assign({name:'Sub-Total Corporate'}, grp.corporateTotal), 'subtotal') : ''}` : ''}
               ${grp.districtRows.length ? `<tr><td colspan="${groupHeadColspan}" style="font-weight:700;background:var(--panel-soft,#f4f6f8);">${tx('Districts')}</td></tr>
               ${grp.districtRows.map(r=>compDataRow(r)).join('')}
-              ${compDataRow(Object.assign({name:'District Sub-total'}, grp.districtTotal), 'subtotal')}` : ''}
+              ${unitSubtotalsApply(i) ? compDataRow(Object.assign({name:'Sub-Total Districts'}, grp.districtTotal), 'subtotal') : ''}` : ''}
               ${compDataRow(Object.assign({name:'Grand Total'}, grp.grandTotal), 'subtotal grand')}
             </tbody>
           </table>
@@ -7990,10 +8108,10 @@ function renderQuarterReports(){
             <tbody>
               ${grp.corporateRows.length ? `<tr><td colspan="${groupHeadColspan}" style="font-weight:700;background:var(--panel-soft,#f4f6f8);">${tx('Corporate')}</td></tr>
               ${grp.corporateRows.map(r=>balanceDataRow(r, sc)).join('')}
-              ${balanceDataRow(Object.assign({name:'Corporate Sub-total'}, grp.corporateTotal), sc, 'subtotal')}` : ''}
+              ${unitSubtotalsApply(i) ? balanceDataRow(Object.assign({name:'Sub-Total Corporate'}, grp.corporateTotal), sc, 'subtotal') : ''}` : ''}
               ${grp.districtRows.length ? `<tr><td colspan="${groupHeadColspan}" style="font-weight:700;background:var(--panel-soft,#f4f6f8);">${tx('Districts')}</td></tr>
               ${grp.districtRows.map(r=>balanceDataRow(r, sc)).join('')}
-              ${balanceDataRow(Object.assign({name:'District Sub-total'}, grp.districtTotal), sc, 'subtotal')}` : ''}
+              ${unitSubtotalsApply(i) ? balanceDataRow(Object.assign({name:'Sub-Total Districts'}, grp.districtTotal), sc, 'subtotal') : ''}` : ''}
               ${balanceDataRow(Object.assign({name:'Grand Total'}, grp.grandTotal), sc, 'subtotal grand')}
             </tbody>
           </table>
@@ -8398,9 +8516,15 @@ function buildComparativeSheet(cm, sections, grandTotalRow, meta){
 
   function putCompRow(label, row, isTotal){
     put(r,0,label, isTotal?XLS_STYLE.subtotal:XLS_STYLE.cell);
+    const _role = row.mergeRole, _mk = row.mergeKeys, _md = row.mergedDisplay;
     colOrder.forEach((key,i)=>{
       const col = i+1;
-      const val = row[key];
+      let src = row;
+      if(_role && _mk.has(key)){
+        if(_role==='second'){ put(r,col,null,PCT_KEYS.includes(key)?XLS_STYLE.cellPct:XLS_STYLE.cellNumTbl,'s'); return; }
+        src = _md; xlsMerge(ws,r,col,r+1,col);
+      }
+      const val = src[key];
       if(PCT_KEYS.includes(key)){
         const style = CHANGE_KEYS.includes(key) ? changeStyle(val, isTotal) : perfStyle(val, isTotal);
         put(r,col, isFinite(val)?val:null, style, 'n');
@@ -8413,7 +8537,7 @@ function buildComparativeSheet(cm, sections, grandTotalRow, meta){
   sections.forEach(sec=>{
     if(sec.label){ put(r,0,tx(sec.label),XLS_STYLE.group); xlsMerge(ws,r,0,r,lastCol); r++; }
     sec.rows.forEach(row=>putCompRow(tx(row.sector||row.name), row, false));
-    putCompRow(tx(sec.totalLabel||'Total'), sec.total, true);
+    if(sec.total) putCompRow(tx(sec.totalLabel||'Total'), sec.total, true);
   });
   if(grandTotalRow){
     put(r,0,tx('Grand Total'), XLS_STYLE.grand);
@@ -8783,9 +8907,15 @@ function buildBalanceNplUnitSheet(bm, grp, meta){
   r = hr+4;
 
   function putDataCols(row, kind){ // kind: 'cell' | 'subtotal' | 'grand'
+    const _role = row.mergeRole, _mk = row.mergeKeys, _md = row.mergedDisplay;
     colOrder.forEach((key,i)=>{
       const col = 2+i;
-      const val = row[key];
+      let src = row;
+      if(_role && _mk.has(key)){
+        if(_role==='second'){ put(r,col,null,PCT_KEYS.includes(key)?XLS_STYLE.cellPct:XLS_STYLE.cellNumTbl,'s'); return; }
+        src = _md; xlsMerge(ws,r,col,r+1,col);
+      }
+      const val = src[key];
       if(PCT_KEYS.includes(key)){
         const base = kind==='grand' ? XLS_STYLE.grandPct : kind==='subtotal' ? XLS_STYLE.subtotalPct : XLS_STYLE.cellPct;
         const st = pctStyle(base, key);
@@ -8797,8 +8927,8 @@ function buildBalanceNplUnitSheet(bm, grp, meta){
     });
   }
   [
-    { label:'Corporate',        rows:grp.corporateRows, totalLabel:'Corporate Total', total:grp.corporateTotal },
-    { label:'SMEs/Districts',   rows:grp.districtRows,  totalLabel:'SMEs Total',      total:grp.districtTotal }
+    { label:'Corporate',        rows:grp.corporateRows },
+    { label:'SMEs/Districts',   rows:grp.districtRows }
   ].forEach(sec=>{
     if(!sec.rows.length) return;
     const startRow = r;
@@ -8809,9 +8939,6 @@ function buildBalanceNplUnitSheet(bm, grp, meta){
     });
     put(startRow,0,tx(sec.label),XLS_STYLE.group);
     if(r-1>startRow) xlsMerge(ws,startRow,0,r-1,0);
-    put(r,0,tx(sec.totalLabel),XLS_STYLE.subtotal); xlsMerge(ws,r,0,r,1);
-    putDataCols(sec.total, 'subtotal');
-    r++;
   });
   put(r,0,tx('Grand-Total'),XLS_STYLE.grand); xlsMerge(ws,r,0,r,1);
   putDataCols(grp.grandTotal, 'grand');
@@ -8874,8 +9001,8 @@ function exportQuarterSectorLoaningUnit(){
   // header + all-zero subtotal that the on-screen table wouldn't show either).
   groupUnitReports.forEach((grp,i)=>{
     const sections = [];
-    if(grp.corporateRows.length) sections.push({ label:'Corporate', rows:grp.corporateRows, total:grp.corporateTotal, totalLabel:'Corporate Sub-total' });
-    if(grp.districtRows.length) sections.push({ label:'Districts', rows:grp.districtRows, total:grp.districtTotal, totalLabel:'District Sub-total' });
+    if(grp.corporateRows.length) sections.push({ label:'Corporate', rows:grp.corporateRows, total: unitSubtotalsApply(i) ? grp.corporateTotal : undefined, totalLabel:'Sub-Total Corporate' });
+    if(grp.districtRows.length) sections.push({ label:'Districts', rows:grp.districtRows, total: unitSubtotalsApply(i) ? grp.districtTotal : undefined, totalLabel:'Sub-Total Districts' });
     const ws = buildComparativeSheet(sectorComparativeMeta, sections, grp.grandTotal,
       { title: tx(grp.reportBase)+' '+activityLabel, periodLabel, finLabel, segmentLabel, sc, today, firstColLabel:'Loaning Unit', footer: optionFooter, hideSegmentLabel: i>0,
         warningLines: groupMismatchWarningLines(groupConsistency, i, sectorComparativeMeta, sc) });
@@ -8934,8 +9061,8 @@ function exportQuarterBalanceSectorLoaningUnit(){
 
   bal.groupUnitReports.forEach((grp,i)=>{
     const sections = [];
-    if(grp.corporateRows.length) sections.push({ label:'Corporate', rows:grp.corporateRows, total:grp.corporateTotal, totalLabel:'Corporate Sub-total' });
-    if(grp.districtRows.length) sections.push({ label:'Districts', rows:grp.districtRows, total:grp.districtTotal, totalLabel:'District Sub-total' });
+    if(grp.corporateRows.length) sections.push({ label:'Corporate', rows:grp.corporateRows, total: unitSubtotalsApply(i) ? grp.corporateTotal : undefined, totalLabel:'Sub-Total Corporate' });
+    if(grp.districtRows.length) sections.push({ label:'Districts', rows:grp.districtRows, total: unitSubtotalsApply(i) ? grp.districtTotal : undefined, totalLabel:'Sub-Total Districts' });
     const ws = buildComparativeSheet(bal.sectorComparativeMeta, sections, grp.grandTotal,
       { title: tx(grp.reportBase)+' '+balTitleSuffix, periodLabel, finLabel, segmentLabel, sc, today, firstColLabel:'Loaning Unit', hideSegmentLabel: i>0,
         warningLines: groupMismatchWarningLines(bal.groupConsistency, i, bal.sectorComparativeMeta, sc) });
@@ -9008,8 +9135,8 @@ function exportQuarterGroupExcel(family, scope, groupIndex){
     } else {
       const grp = groupUnitReports[groupIndex];
       const sections = [];
-      if(grp.corporateRows.length) sections.push({ label:'Corporate', rows:grp.corporateRows, total:grp.corporateTotal, totalLabel:'Corporate Sub-total' });
-      if(grp.districtRows.length) sections.push({ label:'Districts', rows:grp.districtRows, total:grp.districtTotal, totalLabel:'District Sub-total' });
+      if(grp.corporateRows.length) sections.push({ label:'Corporate', rows:grp.corporateRows, total: unitSubtotalsApply(groupIndex) ? grp.corporateTotal : undefined, totalLabel:'Sub-Total Corporate' });
+      if(grp.districtRows.length) sections.push({ label:'Districts', rows:grp.districtRows, total: unitSubtotalsApply(groupIndex) ? grp.districtTotal : undefined, totalLabel:'Sub-Total Districts' });
       const optionFooter = (f.reportOption||'option1')==='option1'
         ? tx('Option 1: Consumer sector loans reallocated from Districts to Human Resource Management Directorate') : null;
       const ws = buildComparativeSheet(sectorComparativeMeta, sections, grp.grandTotal,
@@ -9087,8 +9214,8 @@ function exportQuarterGroupExcel(family, scope, groupIndex){
     } else {
       const grp = bal.groupUnitReports[groupIndex];
       const sections = [];
-      if(grp.corporateRows.length) sections.push({ label:'Corporate', rows:grp.corporateRows, total:grp.corporateTotal, totalLabel:'Corporate Sub-total' });
-      if(grp.districtRows.length) sections.push({ label:'Districts', rows:grp.districtRows, total:grp.districtTotal, totalLabel:'District Sub-total' });
+      if(grp.corporateRows.length) sections.push({ label:'Corporate', rows:grp.corporateRows, total: unitSubtotalsApply(groupIndex) ? grp.corporateTotal : undefined, totalLabel:'Sub-Total Corporate' });
+      if(grp.districtRows.length) sections.push({ label:'Districts', rows:grp.districtRows, total: unitSubtotalsApply(groupIndex) ? grp.districtTotal : undefined, totalLabel:'Sub-Total Districts' });
       const ws = buildComparativeSheet(bal.sectorComparativeMeta, sections, grp.grandTotal,
         { title: tx(grp.reportBase)+' '+balTitleSuffix, periodLabel, finLabel, segmentLabel, sc, today, firstColLabel:'Loaning Unit', hideSegmentLabel: groupIndex>0,
           warningLines: groupMismatchWarningLines(bal.groupConsistency, groupIndex, bal.sectorComparativeMeta, sc) });
@@ -9614,7 +9741,7 @@ function aggregateReport(){
   // RETIRED_UNIT_MAP) and are not shown as separate rows in the Report section —
   // but only for reports whose own period has reached the transition. For an
   // earlier report the retired unit is still a normal row under its own name.
-  if(dimKey==='operatingUnit' && aggregationActive) dims = dims.filter(name=>!RETIRED_UNIT_NAMES.includes(name));
+  if(dimKey==='operatingUnit' && aggregationActive) dims = dims.filter(keepSplitDimFilter);
   if(dimKey==='operatingUnit' && leaseIjarahOnly) dims = dims.filter(name=>unitGroup(name)!=='Corporate');
   // Districts A–Z; Corporate units in the fixed order set by management (see
   // CORPORATE_DISPLAY_ORDER).
@@ -9626,7 +9753,7 @@ function aggregateReport(){
 
   let rows = dims.map(name=>{
     const subset = dimKey==='operatingUnit'
-      ? recs.filter(r=>effectiveOperatingUnit(r, f.reportOption, aggregationActive)===name)
+      ? recs.filter(r=>effectiveOperatingUnit(r, f.reportOption, aggregationActive, true)===name)
       : recs.filter(r=>r[dimKey]===name);
     const planThis = sumFor(subset, range.thisPeriod, 'plan');
     const actualThis = sumFor(subset, range.thisPeriod, 'actual');
@@ -9648,15 +9775,24 @@ function aggregateReport(){
   // where it truly has no data, and reappears for whichever period(s) it
   // actually reported in — including a retired/legacy unit's own historical period,
   // and including FY2025/26+ once a current-structure unit has data of its own.
+  let efRow;
   if(dimKey==='operatingUnit'){
+    if(aggregationActive){ efRow = rows.find(r=>r.name===EF_UNIT); if(efRow) rows = rows.filter(r=>r.name!==EF_UNIT); }
+    const rowsRaw = rows;
     rows = rows.filter(r=> (r.group!=='Corporate' && !LEGACY_ZERO_HIDE_UNITS.includes(r.name)) || r.planThis || r.actualThis || r.planCum || r.actualCum);
+    const corpShown = markSplitUnitMerge(rows.filter(r=>r.group==='Corporate'), rowsRaw.filter(r=>r.group==='Corporate'), efRow,
+      ['planThis','actualThis','planCum','actualCum'],
+      { perfThis:['planThis','actualThis'], perfCum:['planCum','actualCum'] },
+      o=>{ o.perfThis = o.planThis? o.actualThis/o.planThis : (o.actualThis>0?1:NaN); o.perfCum = o.planCum? o.actualCum/o.planCum : (o.actualCum>0?1:NaN); });
+    rows = corpShown.concat(rows.filter(r=>r.group!=='Corporate'));
   }
 
-  return { range, dimKey, rows };
+  return { range, dimKey, rows, efRow };
 }
 
 function renderReportTable(){
-  const { range, dimKey, rows } = aggregateReport();
+  const { range, dimKey, rows, efRow } = aggregateReport();
+  const efExtra = efRow ? [efRow] : [];
   const metricLabel = tx(({approval:'Approval', disbursement:'Disbursement', collection:'Total Collection'})[STATE.reportFilters.metric]);
   const finLabel = financingTypeSelectionLabel(STATE.reportFilters.financingTypes);
   const today = todayLabel();
@@ -9685,10 +9821,10 @@ function renderReportTable(){
         ${reportRowCells(tx(r.name), r)}
         </tr>`;
       });
-      const tt = withPerf(totalsOf(list));
+      const tt = withPerf(totalsOf(grp==='Corporate' ? list.concat(efExtra) : list));
       bodyRows += `<tr class="subtotal"><td></td>${reportRowCells(tx(subLabel), tt)}</tr>`;
     });
-    const grand = withPerf(totalsOf(rows));
+    const grand = withPerf(totalsOf(rows.concat(efExtra)));
     bodyRows += `<tr class="grandtotal"><td colspan="2">${tx('Grand Total')}</td>${reportRowCells(null, grand, true)}</tr>`;
   } else {
     groupColHeader = ''; // no group dimension for this view
@@ -9741,6 +9877,9 @@ function renderReportTable(){
   `;
 }
 function reportRowCells(name, r, skipName){
+  return splitMergeRender(r, ['planThis','actualThis','perfThis','planCum','actualCum','perfCum'], x=>reportRowCellsRaw(name, x, skipName));
+}
+function reportRowCellsRaw(name, r, skipName){
   const sc = STATE.reportFilters.scale || 'thousand';
   return `${skipName? '' : `<td>${escapeHtml(name)}</td>`}
     <td class="num">${fmtScaled(r.planThis, sc)}</td><td class="num">${fmtScaled(r.actualThis, sc)}</td><td class="num ${perfClass(r.perfThis)}">${fmtPct(r.perfThis)}</td>
@@ -9896,7 +10035,8 @@ function xlsFinalizeSheet(ws, lastRow, lastCol, opts){
 }
 
 function exportReport(){
-  const { range, dimKey, rows } = aggregateReport();
+  const { range, dimKey, rows, efRow } = aggregateReport();
+  const efExtra = efRow ? [efRow] : [];
   const f = STATE.reportFilters;
   const metricLabel = tx(({approval:'Approval', disbursement:'Disbursement', collection:'Total Collection'})[f.metric]);
   const finLabel = financingTypeSelectionLabel(f.financingTypes);
@@ -9966,12 +10106,16 @@ function exportReport(){
     let cc = 0;
     if(withGroup){ put(r,cc,groupVal!=null?groupVal:'',textStyle); cc++; }
     put(r,cc,label,textStyle); cc++;
-    put(r,cc,scaleDivide(rr.planThis, f.scale),numStyle,'n'); cc++;
-    put(r,cc,scaleDivide(rr.actualThis, f.scale),numStyle,'n'); cc++;
-    putPerf(r,cc,rr.perfThis,pctStyle); cc++;
-    put(r,cc,scaleDivide(rr.planCum, f.scale),numStyle,'n'); cc++;
-    put(r,cc,scaleDivide(rr.actualCum, f.scale),numStyle,'n'); cc++;
-    putPerf(r,cc,rr.perfCum,pctStyle); cc++;
+    ['planThis','actualThis','perfThis','planCum','actualCum','perfCum'].forEach(k=>{
+      let src = rr;
+      if(rr.mergeRole && rr.mergeKeys.has(k)){
+        if(rr.mergeRole==='second'){ put(r,cc,null,numStyle,'s'); cc++; return; }
+        src = rr.mergedDisplay; xlsMerge(ws,r,cc,r+1,cc);
+      }
+      if(k==='perfThis'||k==='perfCum') putPerf(r,cc,src[k],pctStyle);
+      else put(r,cc,scaleDivide(src[k], f.scale),numStyle,'n');
+      cc++;
+    });
     r++;
   }
 
@@ -9983,10 +10127,10 @@ function exportReport(){
       list.forEach(rr=>writeRow(rr,{label:rr.name, textStyle:XLS_STYLE.cell, numStyle:XLS_STYLE.cellNum, pctStyle:cellPctR, groupVal:''}));
       put(startRow,0,tx(grp),XLS_STYLE.group);
       if(r-1>startRow) xlsMerge(ws,startRow,0,r-1,0);
-      const t = withPerf(totalsOf(list));
+      const t = withPerf(totalsOf(grp==='Corporate' ? list.concat(efExtra) : list));
       writeRow(t,{label:tx(subLabel), textStyle:XLS_STYLE.subtotal, numStyle:XLS_STYLE.subtotalNum, pctStyle:subtotalPctR, groupVal:''});
     });
-    const grand = withPerf(totalsOf(rows));
+    const grand = withPerf(totalsOf(rows.concat(efExtra)));
     const grandRow = r;
     writeRow(grand,{label:'', textStyle:XLS_STYLE.grand, numStyle:XLS_STYLE.grandNum, pctStyle:grandPctR, groupVal:tx('Grand Total')});
     xlsMerge(ws,grandRow,0,grandRow,1);
@@ -16736,7 +16880,28 @@ async function handleHistoricalImportFile(file){
           ${skipped.slice(0,MAX_SHOWN).map(s=>`<li>Row ${s.row}: ${escapeHtml(s.reason)}</li>`).join('')}
           ${skipped.length>MAX_SHOWN?`<li>…and ${skipped.length-MAX_SHOWN} more.</li>`:''}
         </ul>` : ''}
-      ${rows.length ? `<button class="btn primary sm" id="btn-do-historical-import" style="margin-top:12px;">Import ${rows.length} record(s)</button>` : ''}
+      ${rows.length ? (()=>{
+        const kOf = r => [r.operatingUnit, r.sector, r.category, r.financingType, r.period].join('|');
+        const existingKeys = new Set(STATE.records.map(kOf));
+        const matching = rows.filter(r=>existingKeys.has(kOf(r))).length;
+        const periodSet = new Set(rows.map(r=>r.period));
+        const inPeriods = STATE.records.filter(r=>periodSet.has(r.period)).length;
+        const mode = STATE.historicalImportMode==='replace' ? 'replace' : 'append';
+        return `
+        <div class="field" style="margin-top:12px;">
+          <label>${tx('On import')}</label>
+          <select id="historical-import-mode">
+            <option value="append" ${mode==='append'?'selected':''}>${tx('Append — keep existing data and add these figures')}</option>
+            <option value="replace" ${mode==='replace'?'selected':''}>${tx('Replace — clear existing data for the periods in this file, then import')}</option>
+          </select>
+          <div style="font-size:11.5px;color:var(--ink-500);margin-top:6px;">
+            ${fmtRows(matching)} of ${fmtRows(rows.length)} record(s) in this file match a record already on file; ${fmtRows(inPeriods)} existing record(s) fall in the file's period(s).
+            <br><strong>Append</strong>: new records are added, and where a record already exists the file's figures are <em>added to</em> its figures (importing the same file twice would double them).
+            <br><strong>Replace</strong>: every existing record in the period(s) ${escapeHtml([...periodSet].sort()[0]||'')}${periodSet.size>1?' – '+escapeHtml([...periodSet].sort().slice(-1)[0]):''} is removed first, so the file becomes the only data for those period(s).
+          </div>
+        </div>
+        <button class="btn primary sm" id="btn-do-historical-import" style="margin-top:12px;">Import ${rows.length} record(s)</button>`;
+      })() : ''}
       ${differentDups.length ? `<button class="btn sm" id="btn-download-dups-historical" style="margin-top:12px;margin-left:8px;">Download the ${fmtRows(differentDups.length)} repeated row(s) with different figures</button>` : ''}
       ${skipped.length ? `<button class="btn sm" id="btn-download-skipped-historical" style="margin-top:12px;${rows.length?'margin-left:8px;':''}">Download all ${fmtRows(skipped.length)} skipped row(s) with reasons</button>` : ''}
     `;
@@ -16762,9 +16927,21 @@ async function handleHistoricalImportFile(file){
       XLSX.utils.book_append_sheet(wbS, wsS, 'Skipped rows');
       XLSX.writeFile(wbS, 'Historical_Import_Skipped_Rows.xlsx');
     });
+    const histModeSel = document.getElementById('historical-import-mode');
+    if(histModeSel) histModeSel.addEventListener('change', ()=>{ STATE.historicalImportMode = histModeSel.value; });
     const doBtn = document.getElementById('btn-do-historical-import');
     if(doBtn) doBtn.addEventListener('click', async ()=>{
       const keyOf = r => [r.operatingUnit, r.sector, r.category, r.financingType, r.period].join('|');
+      const mode = STATE.historicalImportMode==='replace' ? 'replace' : 'append';
+      let removed = 0;
+      if(mode==='replace'){
+        const periodSet = new Set(STATE.historicalImport.rows.map(r=>r.period));
+        const toRemove = STATE.records.filter(r=>periodSet.has(r.period)).length;
+        const ps = [...periodSet].sort();
+        if(!confirm('Replace: this will remove the '+toRemove+' existing record(s) for '+ps[0]+(ps.length>1?' – '+ps[ps.length-1]:'')+' and import the '+STATE.historicalImport.rows.length+' record(s) from the file in their place. Continue?')) return;
+        STATE.records = STATE.records.filter(r=>!periodSet.has(r.period));
+        removed = toRemove;
+      }
       const byKey = new Map();
       STATE.records.forEach(r=>byKey.set(keyOf(r), r));
       let created=0, merged=0;
@@ -16772,7 +16949,8 @@ async function handleHistoricalImportFile(file){
         const k = keyOf(row);
         const existing = byKey.get(k);
         if(existing){
-          Object.assign(existing, row, { id: existing.id });
+          // Append: add the file's figures to the existing record (other fields stay as they are).
+          NUMERIC_FIELDS.forEach(f=>{ existing[f] = (existing[f]||0) + (row[f]||0); });
           merged++;
         } else {
           STATE.records.push(row);
@@ -16792,7 +16970,7 @@ async function handleHistoricalImportFile(file){
         await storeSet(STORE_KEYS.masterLists, STATE.masterLists);
       }
       await storeSet(STORE_KEYS.records, STATE.records);
-      logAudit('Historical data bulk import', created+' new and '+merged+' merged record(s)'+(unitsToAdd.length?', '+unitsToAdd.length+' legacy Operating Unit(s) registered,':'')+' imported from "'+STATE.historicalImport.fileName+'".');
+      logAudit('Historical data bulk import ('+mode+')', (mode==='replace' ? removed+' existing record(s) replaced; ' : '')+created+' new and '+merged+(mode==='replace' ? ' merged' : ' added-to')+' record(s)'+(unitsToAdd.length?', '+unitsToAdd.length+' legacy Operating Unit(s) registered,':'')+' imported from "'+STATE.historicalImport.fileName+'".');
       STATE.historicalImport = { rows:null, errors:[], skipped:[], fileName:null, newUnits:[] };
       render();
     });
